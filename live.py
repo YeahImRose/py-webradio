@@ -14,7 +14,7 @@ import subprocess
 import collections
 from mutagen.mp3 import MP3
 
-path = "localhost"
+ip = "0.0.0.0"
 port = 80
 base_dir = os.path.dirname(__file__)
 dirs = next(os.walk(base_dir))[1]
@@ -29,6 +29,8 @@ run_signal = True
 class Station():
     def __init__(self, name):
         self.station_name = name
+        #self.file_type = file_type
+        #self.path = file_type + name
         self.song_name = ""
         self.song_path = ""
         self.audio_buffer = io.BytesIO()
@@ -73,15 +75,36 @@ class StationServer():
         with print_lock:
             print("Station {} is now playing {}".format(self.station, new_song))
         stations[self.station].song_name = new_song
-        stations[self.station].song_path = os.path.join(base_dir, self.station, new_song)
+        song_path = os.path.join(base_dir, self.station, new_song)
+        stations[self.station].song_path = song_path
         if self.file:
             self.file.close()
+        fname, fext = os.path.splitext(song_path)
+        match fext:
+            case ".mp3":
+                self.switchSongMP3()
+            case ".webm":
+                self.switchSongWEBM()
+            case _:
+                pass
+
+    def switchSongMP3(self):
         self.file = open(stations[self.station].song_path, 'rb')
         source = MP3(stations[self.station].song_path)
         length = source.info.length
         self.delay = (length * CHUNK_SIZE) / os.path.getsize(stations[self.station].song_path)
-        print(self.delay)
+        #print(self.delay)
 
+    def switchSongWEBM(self):
+        self.file = open(stations[self.station].song_path, 'rb')
+        length = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                 "format=duration", "-of",
+                                 "default=noprint_wrappers=1:nokey=1", stations[self.station].song_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT)
+        length = float(length.stdout)
+        self.delay = (length * CHUNK_SIZE) / os.path.getsize(stations[self.station].song_path)
+        #print(self.delay)
 
     #run this every 150 ms
     def stream(self):
@@ -108,8 +131,9 @@ class StationServer():
 
             end_time = time.time()
             delta = end_time - start_time
-            with print_lock:
-                print(delta)
+            if delta > 0.1:
+                with print_lock:
+                    print("Delay on station {} of {:1.32f}s".format(self.station, delta))
             time.sleep(max(self.delay - delta, 0))
         threads.remove(threading.current_thread())
 
@@ -117,8 +141,14 @@ class StationServer():
 class ReqHandler(http.server.SimpleHTTPRequestHandler):
     def _set_headers(self):
         self.send_response(200)
-        #self.send_header('Content-Type', 'audio/x-wav')
-        self.send_header('Content-Type', 'audio/mpeg')
+        fname, fext = os.path.splitext(stations[self.station].song_path)
+        match fext:
+            case ".mp3":
+                self.send_header('Content-Type', 'audio/mpeg')
+            case ".webm":
+                self.send_header('Content-Type', 'video/webm')
+            case _:
+                pass
         self.send_header("Connection", "keep-alive")
         #self.send_header('Transfer-Encoding', 'chunked')
         #self.send_header('Content-Disposition', "attachment;filename*=UTF-8''{}".format(urllib.parse.quote(self.filename.encode('utf-8'))))
@@ -128,11 +158,8 @@ class ReqHandler(http.server.SimpleHTTPRequestHandler):
         if self.path == "/":
             return None
         elif self.path == "/favicon.ico":
-            #self.path = os.path.join("live", "favicon.ico")
-            #return True
             return None
         else:
-            self.station = self.path.strip("/").strip("..").replace("\\\\", "\\")
             self.path = stations[self.station].song_path
             return True
 
@@ -154,7 +181,7 @@ class ReqHandler(http.server.SimpleHTTPRequestHandler):
         threads.remove(threading.current_thread())
 
     def writeContent(self):
-        if self.path.endswith(".mp3"):
+        if self.path.startswith(os.path.abspath(base_dir) + os.sep):
             conn = Connection()
             conn_pool.addConnection(self.station, conn)
             new_thread = threading.Thread(target=self.continuousPlayback, args=(conn, ))
@@ -162,11 +189,12 @@ class ReqHandler(http.server.SimpleHTTPRequestHandler):
             threads.append(new_thread)
         else:
             return None
-            with open(self.path, mode='rb') as f:
-                content = f.read()
-                self.wfile.write(content)
 
     def do_GET(self):
+        self.station = self.path.strip("/")
+        self.station = urllib.parse.quote(self.station, safe="")
+        if len(self.headers.values()) < 3:
+            return None
         if self.resolvePath() is None:
             return
         if len(stations[self.station].prebuffer) != PREBUFFER_SIZE:
@@ -177,7 +205,7 @@ class ReqHandler(http.server.SimpleHTTPRequestHandler):
 
 def serve(handle):
     try:
-        with http.server.ThreadingHTTPServer(("localhost", port), handler) as httpd:
+        with http.server.ThreadingHTTPServer((ip, port), handler) as httpd:
             httpd.serve_forever()
     except:
         return
